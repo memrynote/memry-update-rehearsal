@@ -40,7 +40,10 @@ jobs:
           APPLE_ID: ${{ runner.os == 'macOS' && secrets.APPLE_ID || '' }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ runner.os == 'macOS' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
           APPLE_TEAM_ID: ${{ runner.os == 'macOS' && secrets.APPLE_TEAM_ID || '' }}
-        run: node scripts/rehearsal/build-electron-rehearsal.mjs "${{ inputs.electron_tag }}" "${{ inputs.feed_repo }}" --keep
+        run: |
+          ulimit -n 65536 || ulimit -n 10240 || true
+          ulimit -n
+          node scripts/rehearsal/build-electron-rehearsal.mjs "${{ inputs.electron_tag }}" "${{ inputs.feed_repo }}" --keep
       - name: Collect artifacts
         shell: bash
         run: |
