@@ -1,0 +1,59 @@
+name: Win Electron Probe
+on:
+  workflow_dispatch:
+    inputs:
+      feed_repo:
+        default: memrynote/memry-update-rehearsal
+      source_ref:
+        default: feat/3524-update-bridge
+      electron_tag:
+        default: v2026-10-15
+env:
+  CI: true
+  HUSKY: 0
+  NODE_OPTIONS: --max-old-space-size=4096
+  SKIP_ELECTRON_REBUILD: 1
+jobs:
+  build-electron-rehearsal:
+    name: Electron rehearsal ${{ inputs.electron_tag }} (${{ matrix.os }})
+    if: inputs.electron_tag != ''
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: memrynote/memry
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-pnpm
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Build from the tag with the rehearsal feed
+        env:
+          CSC_LINK: ${{ runner.os == 'macOS' && secrets.MACOS_CERTIFICATE_P12 || '' }}
+          CSC_KEY_PASSWORD: ${{ runner.os == 'macOS' && secrets.MACOS_CERTIFICATE_PASSWORD || '' }}
+          APPLE_ID: ${{ runner.os == 'macOS' && secrets.APPLE_ID || '' }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ runner.os == 'macOS' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ runner.os == 'macOS' && secrets.APPLE_TEAM_ID || '' }}
+        run: node scripts/rehearsal/build-electron-rehearsal.mjs "${{ inputs.electron_tag }}" "${{ inputs.feed_repo }}" --keep
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          out="electron-out"; mkdir -p "$out"
+          dist=".worktrees/electron-rehearsal-${{ inputs.electron_tag }}/apps/desktop/dist"
+          case "$RUNNER_OS" in
+            macOS) cp "$dist"/*.zip "$out"/ ;;
+            Windows) cp "$dist"/*-setup.exe "$out"/ && cp -R "$dist/win-unpacked" "$out"/ ;;
+            Linux) cp "$dist"/*.AppImage "$out"/ ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MemryNote-${{ inputs.electron_tag }}-rehearsal-${{ matrix.os }}
+          path: electron-out/
+          if-no-files-found: error
+
