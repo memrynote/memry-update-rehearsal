@@ -7,7 +7,7 @@ on:
       source_ref:
         default: feat/3524-update-bridge
       electron_tag:
-        default: v2026-10-15
+        default: v2026.4.28
 env:
   CI: true
   HUSKY: 0
@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2022]
+        os: [macos-15]
     steps:
       - uses: actions/checkout@v6
         with:
