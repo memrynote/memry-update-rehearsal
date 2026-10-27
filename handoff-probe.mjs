@@ -18,7 +18,7 @@ const app = spawn(path.join(install, 'Memrynote.exe'), ['-n', '12', '127.0.0.1']
 console.log('app pid', app.pid)
 
 const { renderInstallerHandoffScript } = await import(
-  pathToFileURL('apps/desktop/src/main/installer-handoff-script.ts').href
+  pathToFileURL('memry/apps/desktop/src/main/installer-handoff-script.ts').href
 )
 const plan = {
   appPid: app.pid,
