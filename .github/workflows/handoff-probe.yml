@@ -1,0 +1,36 @@
+name: Handoff probe
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        default: feat/tauri-v2
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          path: memry
+          repository: memrynote/memry
+          ref: ${{ inputs.source_ref }}
+          sparse-checkout: |
+            apps/desktop/src/main/installer-handoff-script.ts
+            scripts
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Run the production script like installer-handoff.ts spawns it
+        shell: pwsh
+        run: |
+          $env:PROBE_ARCH = $env:PROCESSOR_ARCHITECTURE
+          "arch: $env:PROCESSOR_ARCHITECTURE"
+          node handoff-probe.mjs
+          Get-Content "$env:RUNNER_TEMP\probe\handoff.log" -EA SilentlyContinue
+          Get-Process | ? { $_.Name -match 'find|tasklist|cmd|ping' } | % { "$($_.Id) $($_.Name)" }
