@@ -36,17 +36,30 @@ const plan = {
 }
 const variant = process.env.VARIANT ?? 'baseline'
 let script = renderInstallerHandoffScript(plan)
-const tl = 'tasklist /FI "PID eq %APP_PID%" /FI "IMAGENAME eq %APP_EXE%" /NH 2>nul | find /I "%APP_EXE%" >nul'
-if (!script.includes(tl)) throw new Error('tasklist line not found')
-if (variant === 'file') {
-  script = script.replace(tl, 'tasklist /FI "PID eq %APP_PID%" /FI "IMAGENAME eq %APP_EXE%" /NH >"%HANDOFF_LOG%.tl" 2>nul\r\nfind /I "%APP_EXE%" "%HANDOFF_LOG%.tl" >nul')
+const tl0 = 'tasklist /FI "PID eq %APP_PID%" /FI "IMAGENAME eq %APP_EXE%" /NH 2>nul | find /I "%APP_EXE%" >nul'
+const waitBlock = /:wait_for_exit\r\ntasklist[^\r]*\r\nif not errorlevel 1 \(\r\n  ping -n 2 127\.0\.0\.1 >nul\r\n  goto wait_for_exit\r\n\)/
+if (!waitBlock.test(script)) throw new Error('wait block not found')
+if (variant === 'lock') {
+  script = script.replace(waitBlock, [
+    'set /a WAITED=0',
+    ':wait_for_exit',
+    '2>nul ( >>"%INSTALL_DIR%\\%APP_EXE%" (call ) )',
+    'if errorlevel 1 (',
+    '  set /a WAITED+=1',
+    '  ping -n 2 127.0.0.1 >nul',
+    '  goto wait_for_exit',
+    ')',
+  ].join('\r\n'))
 }
-if (variant === 'powershell') {
-  script = script.replace(tl, 'powershell -NoProfile -NonInteractive -Command "Wait-Process -Id %APP_PID% -Timeout 120 -ErrorAction SilentlyContinue" >nul 2>&1\r\nset "WAITED=1"').replace(/if not errorlevel 1 \(\r\n  ping -n 2 127.0.0.1 >nul\r\n  goto wait_for_exit\r\n\)/, 'rem ps waited')
+if (variant === 'ps') {
+  script = script.replace(waitBlock, [
+    'set "PSModulePath="',
+    'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Get-Process -Id %APP_PID% -ErrorAction SilentlyContinue | Where-Object { ($_.ProcessName + \'.exe\') -ieq \'%APP_EXE%\' } | Wait-Process -Timeout 120"',
+  ].join('\r\n'))
 }
 const scriptPath = path.join(root, 'handoff.cmd')
 fs.writeFileSync(scriptPath, script)
-const detached = variant !== 'nondetached'
+const detached = true
 const child = spawn('cmd.exe', ['/c', scriptPath], { detached, stdio: 'ignore', windowsHide: true })
 child.unref()
 if (process.env.EXIT_NOW) { console.log('parent exits now'); process.exit(0) }
