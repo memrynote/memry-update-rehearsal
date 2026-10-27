@@ -29,6 +29,7 @@ jobs:
           $exe = "$env:LOCALAPPDATA\Programs\Memrynote\Memrynote.exe"
           if (-not (Test-Path $exe)) { throw 'NSIS install produced no Memrynote.exe' }
           Get-ChildItem HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall | % { $p = Get-ItemProperty $_.PSPath; "$($_.PSChildName) | $($p.DisplayName)" } | ? { $_ -match 'emry' }
+          New-Item -ItemType Directory -Force "$env:APPDATA\@memry\desktop\logs" | Out-Null
           Start-Process $exe -ArgumentList '--remote-debugging-port=9222'
           Start-Sleep 30
           node scripts/rehearsal/drive-electron-update.mjs 9222 --timeout-s 600
@@ -37,8 +38,9 @@ jobs:
         if: always()
         shell: pwsh
         run: |
+          Get-ChildItem "$env:APPDATA\@memry\desktop" -Name | Select-Object -First 40
           Get-ChildItem $env:APPDATA -Recurse -Filter installer-handoff.log -EA SilentlyContinue | % { $_.FullName; Get-Content $_.FullName }
-          Get-ChildItem $env:APPDATA -Recurse -Filter velopack-setup.log -EA SilentlyContinue | % { $_.FullName; Get-Content $_.FullName -Tail 8 }
+          Get-ChildItem $env:APPDATA -Recurse -Filter velopack-setup.log -EA SilentlyContinue | % { $_.FullName; Get-Content $_.FullName -Tail 40 }
           "--- uninstall key (expect none)"
           Get-ChildItem HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall | % { $p = Get-ItemProperty $_.PSPath; "$($_.PSChildName) | $($p.DisplayName)" } | ? { $_ -match 'emry' }
           "--- LOCALAPPDATA\MemryNote"
