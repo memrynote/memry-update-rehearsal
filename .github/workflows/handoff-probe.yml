@@ -10,7 +10,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-2022, windows-11-arm]
-        variant: [baseline, nondetached, file, powershell]
+        variant: [baseline, nondetached]
     runs-on: ${{ matrix.os }}
     env:
       VARIANT: ${{ matrix.variant }}
@@ -34,6 +34,11 @@ jobs:
         run: |
           $env:PROBE_ARCH = $env:PROCESSOR_ARCHITECTURE
           "arch: $env:PROCESSOR_ARCHITECTURE"
+          $env:EXIT_NOW = '1'
           node handoff-probe.mjs
-          Get-Content "$env:RUNNER_TEMP\probe\handoff.log" -EA SilentlyContinue
+          "parent exited; polling the log"
+          $log = "$env:RUNNER_TEMP\probe\handoff.log"
+          for ($i = 0; $i -lt 60; $i++) { if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'handoff done' -Quiet)) { break }; Start-Sleep 1 }
+          Get-Content $log -EA SilentlyContinue
+          if (-not (Select-String -Path $log -Pattern 'result=velopack' -Quiet)) { throw 'no result=velopack' }
           Get-Process | ? { $_.Name -match 'find|tasklist|cmd|ping' } | % { "$($_.Id) $($_.Name)" }
