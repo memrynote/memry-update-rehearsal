@@ -71,4 +71,4 @@ jobs:
         shell: pwsh
         run: |
           Get-ChildItem "$env:APPDATA\memrynote\logs" -Name -EA SilentlyContinue
-          Get-Content "$env:APPDATA\memrynote\logs\main.log" -EA SilentlyContinue | Select-String 'InstallerHandoff|Updater|hand-off|Velopack|update' | % Line
+          Get-Content "$env:APPDATA\memrynote\logs\main.log" -EA SilentlyContinue | Select-String 'Get-AuthenticodeSignature' -Context 0,25 | Out-String -Width 400
