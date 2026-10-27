@@ -3,42 +3,60 @@ on:
   workflow_dispatch:
     inputs:
       source_ref:
-        default: feat/tauri-v2
+        default: fix/installer-handoff-w2
 jobs:
   probe:
     strategy:
       fail-fast: false
       matrix:
         os: [windows-2022, windows-11-arm]
-        variant: [lock, ps]
     runs-on: ${{ matrix.os }}
-    env:
-      VARIANT: ${{ matrix.variant }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/checkout@v6
         with:
-          path: memry
           repository: memrynote/memry
           ref: ${{ inputs.source_ref }}
           sparse-checkout: |
             apps/desktop/src/main/installer-handoff-script.ts
-            scripts
+            apps/desktop/scripts/installer-handoff-script.mjs
           sparse-checkout-cone-mode: false
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Run the production script like installer-handoff.ts spawns it
+      - name: Wait-Process exit codes
         shell: pwsh
         run: |
-          $env:PROBE_ARCH = $env:PROCESSOR_ARCHITECTURE
-          "arch: $env:PROCESSOR_ARCHITECTURE"
-          $env:EXIT_NOW = '1'
-          node handoff-probe.mjs
-          "parent exited; polling the log"
-          $log = "$env:RUNNER_TEMP\probe\handoff.log"
-          for ($i = 0; $i -lt 60; $i++) { if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'handoff done' -Quiet)) { break }; Start-Sleep 1 }
-          Get-Content $log -EA SilentlyContinue
-          if (-not (Select-String -Path $log -Pattern 'result=velopack' -Quiet)) { throw 'no result=velopack' }
-          Get-Process | ? { $_.Name -match 'find|tasklist|cmd|ping' } | % { "$($_.Id) $($_.Name)" }
+          $sys = "$env:SystemRoot\System32"
+          Copy-Item "$sys\ping.exe" "$env:RUNNER_TEMP\Memrynote.exe"
+          $p = Start-Process "$env:RUNNER_TEMP\Memrynote.exe" -ArgumentList '-n','20','127.0.0.1' -PassThru -WindowStyle Hidden
+          $cmd = "Get-Process -Id $($p.Id) -ErrorAction SilentlyContinue | Where-Object { (`$_.ProcessName + '.exe') -ieq 'Memrynote.exe' } | Wait-Process -Timeout 2"
+          powershell -NoProfile -NonInteractive -Command $cmd *> $null
+          "alive pid, 2s timeout: exit=$LASTEXITCODE (expect 1)"
+          $cmd = "Get-Process -Id 999999 -ErrorAction SilentlyContinue | Where-Object { (`$_.ProcessName + '.exe') -ieq 'Memrynote.exe' } | Wait-Process -Timeout 2"
+          powershell -NoProfile -NonInteractive -Command $cmd *> $null
+          "no such pid: exit=$LASTEXITCODE (expect 0)"
+          "PSModulePath=$env:PSModulePath"
+      - name: Production script, production spawn options, app already quitting
+        shell: pwsh
+        run: |
+          $sys = "$env:SystemRoot\System32"
+          $root = "$env:RUNNER_TEMP\probe"
+          Remove-Item $root -Recurse -Force -EA SilentlyContinue
+          $install = "$root\Programs\Memrynote"
+          New-Item -ItemType Directory -Force $install, "$root\logs" | Out-Null
+          Copy-Item "$sys\ping.exe" "$install\Memrynote.exe"
+          Copy-Item "$sys\whoami.exe" "$install\Uninstall MemryNote.exe"
+          Copy-Item "$sys\whoami.exe" "$root\Setup.exe"
+          New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\MemryNote\current" | Out-Null
+          Copy-Item "$sys\whoami.exe" "$env:LOCALAPPDATA\MemryNote\current\Memrynote.exe"
+          $app = Start-Process "$install\Memrynote.exe" -ArgumentList '-n','15','127.0.0.1' -PassThru -WindowStyle Hidden
+          $t0 = Get-Date
+          node apps/desktop/scripts/installer-handoff-script.mjs --pid $app.Id --exe Memrynote.exe --install-dir $install --setup "$root\Setup.exe" --log "$root\logs\velopack-setup.log" --spawn "$root\handoff.cmd"
+          "spawned; node exited"
+          $log = "$root\logs\installer-handoff.log"
+          for ($i = 0; $i -lt 150; $i++) { if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'handoff done' -Quiet)) { break }; Start-Sleep 1 }
+          "elapsed since app start: $([int]((Get-Date) - $t0).TotalSeconds) s (app lives 15 s)"
+          Get-Content $log
+          $t = Get-Content $log -Raw
+          foreach ($step in 'handoff start', 'app exited', 'uninstall exit=\d+', 'setup exit=\d+', 'result=velopack', 'handoff done') { if ($t -notmatch $step) { throw "log lacks '$step'" } }
