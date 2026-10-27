@@ -10,7 +10,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-2022, windows-11-arm]
+        app: [alive, gone]
     runs-on: ${{ matrix.os }}
+    env:
+      APP_STATE: ${{ matrix.app }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
@@ -24,19 +27,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Wait-Process exit codes
-        shell: pwsh
-        run: |
-          $sys = "$env:SystemRoot\System32"
-          Copy-Item "$sys\ping.exe" "$env:RUNNER_TEMP\Memrynote.exe"
-          $p = Start-Process "$env:RUNNER_TEMP\Memrynote.exe" -ArgumentList '-n','20','127.0.0.1' -PassThru -WindowStyle Hidden
-          $cmd = "Get-Process -Id $($p.Id) -ErrorAction SilentlyContinue | Where-Object { (`$_.ProcessName + '.exe') -ieq 'Memrynote.exe' } | Wait-Process -Timeout 2"
-          powershell -NoProfile -NonInteractive -Command $cmd *> $null
-          "alive pid, 2s timeout: exit=$LASTEXITCODE (expect 1)"
-          $cmd = "Get-Process -Id 999999 -ErrorAction SilentlyContinue | Where-Object { (`$_.ProcessName + '.exe') -ieq 'Memrynote.exe' } | Wait-Process -Timeout 2"
-          powershell -NoProfile -NonInteractive -Command $cmd *> $null
-          "no such pid: exit=$LASTEXITCODE (expect 0)"
-          "PSModulePath=$env:PSModulePath"
       - name: Production script, production spawn options, app already quitting
         shell: pwsh
         run: |
@@ -51,6 +41,7 @@ jobs:
           New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\MemryNote\current" | Out-Null
           Copy-Item "$sys\whoami.exe" "$env:LOCALAPPDATA\MemryNote\current\Memrynote.exe"
           $app = Start-Process "$install\Memrynote.exe" -ArgumentList '-n','15','127.0.0.1' -PassThru -WindowStyle Hidden
+          if ($env:APP_STATE -eq 'gone') { $app.Kill(); $app.WaitForExit() }
           $t0 = Get-Date
           node apps/desktop/scripts/installer-handoff-script.mjs --pid $app.Id --exe Memrynote.exe --install-dir $install --setup "$root\Setup.exe" --log "$root\logs\velopack-setup.log" --spawn "$root\handoff.cmd"
           "spawned; node exited"
