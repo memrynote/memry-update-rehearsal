@@ -1,0 +1,50 @@
+name: W2 NSIS hand-off (x64)
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        default: feat/3524-update-bridge
+jobs:
+  w2:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: memrynote/memry
+          ref: ${{ inputs.source_ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Download the Electron NSIS rehearsal build (run 40406423957)
+        shell: bash
+        run: gh run download 40406423957 -R memrynote/memry-update-rehearsal -D electron -p 'MemryNote-v2026-10-15-rehearsal-*'
+      - name: Install NSIS build and drive the update
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem electron -Recurse -Filter '*-setup.exe' | Select-Object -First 1).FullName
+          Start-Process -Wait -FilePath $setup -ArgumentList '/S'
+          $exe = "$env:LOCALAPPDATA\Programs\Memrynote\Memrynote.exe"
+          if (-not (Test-Path $exe)) { throw 'NSIS install produced no Memrynote.exe' }
+          Get-ChildItem HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall | % { $p = Get-ItemProperty $_.PSPath; "$($_.PSChildName) | $($p.DisplayName)" } | ? { $_ -match 'emry' }
+          Start-Process $exe -ArgumentList '--remote-debugging-port=9222'
+          Start-Sleep 30
+          node scripts/rehearsal/drive-electron-update.mjs 9222 --timeout-s 600
+          Start-Sleep 120
+      - name: Evidence
+        if: always()
+        shell: pwsh
+        run: |
+          Get-ChildItem $env:APPDATA -Recurse -Filter installer-handoff.log -EA SilentlyContinue | % { $_.FullName; Get-Content $_.FullName }
+          Get-ChildItem $env:APPDATA -Recurse -Filter velopack-setup.log -EA SilentlyContinue | % { $_.FullName; Get-Content $_.FullName -Tail 8 }
+          "--- uninstall key (expect none)"
+          Get-ChildItem HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall | % { $p = Get-ItemProperty $_.PSPath; "$($_.PSChildName) | $($p.DisplayName)" } | ? { $_ -match 'emry' }
+          "--- LOCALAPPDATA\MemryNote"
+          Get-ChildItem $env:LOCALAPPDATA\MemryNote -Name -EA SilentlyContinue
+          Get-Content $env:LOCALAPPDATA\MemryNote\current\sq.version -EA SilentlyContinue | Select-String '<version>|<rid>|<channel>'
+          "--- resources\app.asar"
+          Test-Path $env:LOCALAPPDATA\MemryNote\current\resources\app.asar
+          "--- Tauri log"
+          Get-Content $env:LOCALAPPDATA\com.memrynote.memry\logs\main.log -EA SilentlyContinue | Select-Object -Last 8
