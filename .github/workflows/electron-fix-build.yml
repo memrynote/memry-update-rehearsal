@@ -21,11 +21,10 @@ jobs:
       - name: Build the branch with the rehearsal feed
         shell: bash
         run: |
-          sha=$(git rev-parse HEAD)
-          echo "sha=$sha"
-          node scripts/rehearsal/build-electron-rehearsal.mjs "$sha" memrynote/memry-update-rehearsal --keep
+          git tag vfix HEAD
+          node scripts/rehearsal/build-electron-rehearsal.mjs vfix memrynote/memry-update-rehearsal --keep
           mkdir -p electron-out
-          dist=".worktrees/electron-rehearsal-$sha/apps/desktop/dist"
+          dist=".worktrees/electron-rehearsal-vfix/apps/desktop/dist"
           cp "$dist"/*-setup.exe electron-out/
       - uses: actions/upload-artifact@v4
         with:
