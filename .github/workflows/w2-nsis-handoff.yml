@@ -50,3 +50,19 @@ jobs:
           Test-Path $env:LOCALAPPDATA\MemryNote\current\resources\app.asar
           "--- Tauri log"
           Get-Content $env:LOCALAPPDATA\com.memrynote.memry\logs\main.log -EA SilentlyContinue | Select-Object -Last 8
+      - name: Diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          "--- hand-off script leftovers"
+          Get-ChildItem $env:TEMP -Filter 'memry-installer-handoff*' -EA SilentlyContinue | % { "$($_.Name) $($_.LastWriteTime)" }
+          "--- any handoff or velopack-setup logs"
+          Get-ChildItem $env:USERPROFILE -Recurse -Include 'installer-handoff.log','velopack-setup.log' -EA SilentlyContinue | % { $_.FullName; Get-Content $_.FullName }
+          "--- NSIS dir"
+          Get-ChildItem "$env:LOCALAPPDATA\Programs\Memrynote" -EA SilentlyContinue | select -First 8 | % Name
+          "--- NSIS key"
+          Get-ChildItem HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall | % { Get-ItemProperty $_.PSPath } | ? { $_.DisplayName -match 'emry' } | % { "$($_.PSChildName) | $($_.UninstallString) | $($_.DisplayVersion)" }
+          "--- running"
+          Get-Process | ? { $_.Name -match 'emry|Setup|Uninstall|cmd' } | % { "$($_.Id) $($_.Name) $($_.Path)" }
+          "--- main.log tail (Electron)"
+          Get-Content "$env:APPDATA\memrynote\logs\main.log" -EA SilentlyContinue | Select-String 'hand-off|Handoff|quitting|Shutdown' | select -Last 8 | % Line
