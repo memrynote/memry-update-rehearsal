@@ -1,0 +1,39 @@
+name: Authenticode probe
+on: workflow_dispatch
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Download Setup
+        shell: bash
+        run: gh release download rehearsal-2099.101.1 -R memrynote/memry-update-rehearsal -p MemryNote-win-Setup.exe -D dl
+      - name: Direct powershell
+        shell: pwsh
+        run: |
+          $f = (Resolve-Path dl\MemryNote-win-Setup.exe).Path
+          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Get-AuthenticodeSignature -LiteralPath '$f' | ConvertTo-Json -Compress"
+          "exit=$LASTEXITCODE"
+      - name: Through node execFile like the app
+        shell: bash
+        run: |
+          cat > a.js <<'JS'
+          const { execFile } = require('child_process')
+          const f = require('path').resolve('dl/MemryNote-win-Setup.exe')
+          const cmd = `Get-AuthenticodeSignature -LiteralPath '${f}' | ConvertTo-Json -Compress`
+          execFile('powershell.exe', ['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-Command',cmd], { windowsHide: true, timeout: 60000, encoding: 'utf8' }, (e, so, se) => {
+            console.log('err:', e && e.message, 'code', e && e.code, 'signal', e && e.signal)
+            console.log('stdout:', so.slice(0, 600))
+            console.log('stderr:', se.slice(0, 1500))
+          })
+          JS
+          node a.js
