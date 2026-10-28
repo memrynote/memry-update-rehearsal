@@ -1,0 +1,45 @@
+name: Electron main hand-off fix build (win)
+# NSIS build of a memrynote/memry ref (based on main) with the rehearsal feed constants, at a given
+# app version. build-electron-rehearsal.mjs lives on feat/tauri-v2 only, so it is taken from there.
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        required: true
+      app_version:
+        required: true
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: memrynote/memry
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-pnpm
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Build the ref with the rehearsal feed
+        shell: bash
+        env:
+          APP_VERSION: ${{ inputs.app_version }}
+        run: |
+          set -euo pipefail
+          git show origin/feat/tauri-v2:scripts/rehearsal/build-electron-rehearsal.mjs > "$RUNNER_TEMP/build-electron-rehearsal.mjs"
+          node -e "const fs=require('fs');const f='apps/desktop/package.json';const p=JSON.parse(fs.readFileSync(f,'utf8'));p.version=process.env.APP_VERSION;fs.writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
+          git -c user.name=rehearsal -c user.email=rehearsal@invalid commit -qam "rehearsal version $APP_VERSION"
+          git tag vfix HEAD
+          node "$RUNNER_TEMP/build-electron-rehearsal.mjs" vfix memrynote/memry-update-rehearsal --keep
+          mkdir -p electron-out
+          dist=".worktrees/electron-rehearsal-vfix/apps/desktop/dist"
+          cp "$dist"/*-setup.exe electron-out/
+          grep -E 'GITHUB_RELEASE_DOWNLOAD_BASE =|VELOPACK_SETUP_ASSET_NAME =' .worktrees/electron-rehearsal-vfix/apps/desktop/src/main/installer-handoff-script.ts
+          ls -la electron-out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MemryNote-${{ inputs.app_version }}-mainfix-windows-2022
+          path: electron-out/
+          if-no-files-found: error
