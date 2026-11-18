@@ -1,4 +1,4 @@
-# PROOF COPY of memrynote/memry .github/workflows/publish-release.yml at 17798d23401e3b2854a9dc00eab197f60d2aac58, transformed by
+# PROOF COPY of memrynote/memry .github/workflows/publish-release.yml at ff2f94f6429998ae415d72d075a559c6482e107e, transformed by
 # /tmp/s3-proof/transform.mjs (#3556 S3). Not a release workflow.
 name: Publish Desktop Release
 
@@ -62,7 +62,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: memrynote/memry
-          ref: 17798d23401e3b2854a9dc00eab197f60d2aac58
+          ref: ff2f94f6429998ae415d72d075a559c6482e107e
           persist-credentials: false
 
       - name: Setup Node.js
@@ -128,13 +128,14 @@ jobs:
       - name: Resolve publish-day version
         id: version
         env:
+          DRAFT_TAG: ${{ steps.draft.outputs.draft_tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           gh release list --limit 100 --json tagName,isDraft,createdAt --jq '[.[] | select(.isDraft)]' > "$RUNNER_TEMP/releases.json"
           node scripts/resolve-release-version.mjs \
             --releases-file "$RUNNER_TEMP/releases.json" \
-            --ignore-tag "${{ steps.draft.outputs.draft_tag }}"
+            --ignore-tag "$DRAFT_TAG"
 
       # Fails before any build: the sync URL must be the production https host. `build_env.rs`
       # refuses a production build without the required values at compile time.
@@ -208,7 +209,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: memrynote/memry
-          ref: 17798d23401e3b2854a9dc00eab197f60d2aac58
+          ref: ff2f94f6429998ae415d72d075a559c6482e107e
           persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
@@ -459,7 +460,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: memrynote/memry
-          ref: 17798d23401e3b2854a9dc00eab197f60d2aac58
+          ref: ff2f94f6429998ae415d72d075a559c6482e107e
           persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
@@ -561,7 +562,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: memrynote/memry
-          ref: 17798d23401e3b2854a9dc00eab197f60d2aac58
+          ref: ff2f94f6429998ae415d72d075a559c6482e107e
           persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
@@ -748,7 +749,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: memrynote/memry
-          ref: 17798d23401e3b2854a9dc00eab197f60d2aac58
+          ref: ff2f94f6429998ae415d72d075a559c6482e107e
           persist-credentials: false
 
       - name: Setup Node.js
