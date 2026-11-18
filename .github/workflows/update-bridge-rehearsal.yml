@@ -1,873 +1,347 @@
-# Step 07 (#3524): update bridge rehearsal. This file also lives in memrynote/memry-update-rehearsal,
-# where the rehearsal-scoped signing secrets are set; every job checks out memrynote/memry. Builds and packs the Tauri scaffold with Velopack and
-# builds Electron rehearsal baselines whose update feed is fixed to the rehearsal repo. Uploads
-# workflow artifacts only, like publish-release.yml: Windows is signed on Kaan's Mac by
-# scripts/rehearsal/rehearse.mjs, which also writes the bridge feeds and publishes. Publishing to
-# memrynote/memry-update-rehearsal needs Kaan's explicit approval.
-name: Update Bridge Rehearsal
+name: Velopack smoke
+
+# Proves the release on real runners. On Windows x64 and arm64 the signed Setup
+# installs silently, the install layout is what the updater expects, and
+# Update.exe applies a newer package in place while Defender is running. On
+# macOS the notarized dmg installs and UpdateMac applies a newer package. On
+# Linux the AppImage runs. Every launch of the app must write its startup
+# marker line.
+#
+# A job installs `release_tag` and updates it to `to_version` only when
+# `release_tag` carries a Velopack feed of the job's channel. Otherwise (the
+# first Tauri release follows Electron releases, which ship a Velopack feed for
+# Windows x64 only) it installs `update_tag` itself and applies nothing.
+#
+# The second job proves the NSIS -> Velopack hand-off: an install made by the
+# older NSIS installer is removed and replaced by the Velopack install without
+# a gap, with the Start menu shortcut back in place and the app running.
 
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: Rehearsal version, such as 2099.101.1
+      release_tag:
+        description: Release tag holding the installers to update from (Setup.exe, dmg)
         required: true
-      feed_repo:
-        description: Rehearsal feed repository
+      from_version:
+        description: Version of the installers on release_tag
         required: true
-        default: memrynote/memry-update-rehearsal
-      previous_tag:
-        description: Rehearsal tag whose full packages the deltas are built against (empty for the first pack)
+      to_version:
+        description: Version of the nupkg files to apply as an update, and of the AppImage
+        required: true
+      update_tag:
+        description: Release tag holding the to_version assets. Defaults to release_tag.
         required: false
-        default: ''
-      source_ref:
-        description: Branch, tag or commit of memrynote/memry to build. rehearse.mjs build passes the commit it checked and reads its default from here
+      nsis_release_tag:
+        description: Release tag holding the NSIS *-setup.exe used as the "existing install" fixture
         required: false
-        default: feat/tauri-v2
-      electron_tag:
-        description: Production Electron tag to build rehearsal baselines from (empty to skip)
+        default: v2026-09-10
+      run_cli_migration:
+        description: >-
+          Drive the hand-off through `Memrynote.exe --cli migrate-installer` from the NSIS
+          install instead of running the generated script standalone. Only meaningful once
+          nsis_release_tag points at a release whose NSIS build contains the hand-off code.
+        type: boolean
         required: false
-        default: ''
-      tauri_base:
-        description: Published rehearsal version to update from to `version` through the in-app updater (proof only; skips the builds)
-        required: false
-        default: ''
+        default: false
 
 permissions:
+  # read, not write: the release script dispatches this against a release it has
+  # already published, and a read token can download those assets. Pointing it at
+  # an unpublished draft instead would need contents: write, because GITHUB_TOKEN
+  # can only see drafts with push access.
   contents: read
 
-concurrency:
-  group: update-bridge-rehearsal
-  cancel-in-progress: false
-
-env:
-  CI: true
-  HUSKY: 0
-  NODE_OPTIONS: --max-old-space-size=4096
-  CARGO_TERM_COLOR: always
-  # Native modules are rebuilt once by the tag's build-packaged-app; skip the postinstall rebuild.
-  SKIP_ELECTRON_REBUILD: 1
-  VPK_VERSION: 1.2.161
-  MACOSX_DEPLOYMENT_TARGET: '13.0'
-  MEMRY_UPDATE_FEED_URL: https://github.com/${{ inputs.feed_repo }}
-  # A rehearsal build is not a production one: without this, a release build requires the
-  # production sync and calendar values (`apps/desktop-tauri/src-tauri/build_env.rs`).
-  MEMRY_ENV: staging
-  # Inputs reach scripts through the environment, never by interpolation into the script text.
-  # The `validate` job rejects anything that is not a rehearsal value.
-  VERSION: ${{ inputs.version }}
-  FEED_REPO: ${{ inputs.feed_repo }}
-  PREVIOUS_TAG: ${{ inputs.previous_tag }}
-  ELECTRON_TAG: ${{ inputs.electron_tag }}
-  TAURI_BASE: ${{ inputs.tauri_base }}
-
 jobs:
-  validate:
-    name: Validate inputs
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Check the rehearsal inputs
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$VERSION" =~ ^2099\.[0-9]{3,4}\.[0-9]+$ ]] || { echo "::error::version must look like 2099.101.1"; exit 1; }
-          [ "$FEED_REPO" = memrynote/memry-update-rehearsal ] || { echo "::error::feed_repo must be memrynote/memry-update-rehearsal"; exit 1; }
-          [ -z "$PREVIOUS_TAG" ] || [[ "$PREVIOUS_TAG" =~ ^rehearsal-2099\.[0-9]{3,4}\.[0-9]+$ ]] || { echo "::error::previous_tag must be a rehearsal tag"; exit 1; }
-          [ -z "$ELECTRON_TAG" ] || [[ "$ELECTRON_TAG" =~ ^v[0-9][0-9A-Za-z._-]*$ ]] || { echo "::error::electron_tag must be a production tag such as v2026-10-15"; exit 1; }
-          [ -z "$TAURI_BASE" ] || [[ "$TAURI_BASE" =~ ^2099\.[0-9]{3,4}\.[0-9]+$ ]] || { echo "::error::tauri_base must look like 2099.101.1"; exit 1; }
-
-  windows:
-    needs: validate
-    if: inputs.tauri_base == ''
-    name: Windows payload (${{ matrix.target }})
+  smoke-windows:
+    name: Install, verify, update (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: win-x64, os: windows-2022, triple: x86_64-pc-windows-msvc }
-          - { target: win-arm64, os: windows-11-arm, triple: aarch64-pc-windows-msvc }
+          # Names from assetNames in scripts/release/vpk-args.mjs; machine is the PE header field.
+          - os: windows-2022
+            target: win-x64
+            setup: MemryNote-Setup-win-x64.exe
+            feed: releases.win.json
+            nupkg_channel: ''
+            machine: '8664'
+          - os: windows-11-arm
+            target: win-arm64
+            setup: MemryNote-win-arm64-Setup.exe
+            feed: releases.win-arm64.json
+            nupkg_channel: -win-arm64
+            machine: AA64
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      FROM_VERSION: ${{ inputs.from_version }}
+      TO_VERSION: ${{ inputs.to_version }}
+      UPDATE_TAG: ${{ inputs.update_tag || inputs.release_tag }}
+      SETUP: ${{ matrix.setup }}
+      FEED: ${{ matrix.feed }}
+      NUPKG: MemryNote-${{ inputs.to_version }}${{ matrix.nupkg_channel }}-full.nupkg
+      PE_MACHINE: ${{ matrix.machine }}
     steps:
-      - uses: actions/checkout@v6
-        with:
-          repository: memrynote/memry
-          ref: ${{ inputs.source_ref }}
-      - uses: ./.github/actions/setup-pnpm
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-          cache: pnpm
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: '1.98.1'
-          targets: ${{ matrix.triple }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates
-          key: ${{ matrix.os }}
-      - run: pnpm install --frozen-lockfile --ignore-scripts
-      - name: Build
-        run: pnpm --filter @memry/desktop-tauri exec tauri build --no-bundle --target ${{ matrix.triple }}
-      - name: Stage pack dir
-        run: node scripts/release/stage-payload.mjs win ${{ matrix.triple }} pack
-      - name: Check the exe needs no VC++ redistributable
-        run: node scripts/release/pe-imports.mjs pack/Memrynote.exe
-      - name: Zip pack dir
+      - name: Download Velopack assets
         shell: pwsh
-        run: Compress-Archive -Path pack/* -DestinationPath "MemryNote-$env:VERSION-${{ matrix.target }}-payload.zip"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rehearsal-${{ matrix.target }}-payload
-          path: MemryNote-${{ inputs.version }}-${{ matrix.target }}-payload.zip
-          if-no-files-found: error
-
-  macos:
-    needs: validate
-    if: inputs.tauri_base == ''
-    name: macOS pack (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: osx-arm64, os: macos-15, triple: aarch64-apple-darwin, arch: arm64 }
-          - { target: osx-x64, os: macos-15-intel, triple: x86_64-apple-darwin, arch: x64 }
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          repository: memrynote/memry
-          ref: ${{ inputs.source_ref }}
-      - uses: ./.github/actions/setup-pnpm
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-          cache: pnpm
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: '1.98.1'
-          targets: ${{ matrix.triple }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates
-          key: ${{ matrix.os }}
-      - run: pnpm install --frozen-lockfile --ignore-scripts
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 9.0.x
-      - name: Install vpk
-        run: |
-          dotnet tool update -g vpk --version "$VPK_VERSION"
-          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
-          "$HOME/.dotnet/tools/vpk" -h | head -3 | grep -F "Velopack CLI $VPK_VERSION"
-      - name: Build bundle (unsigned)
-        run: pnpm --filter @memry/desktop-tauri exec tauri build --target ${{ matrix.triple }} --bundles app
-      - name: Import signing identity
-        env:
-          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          set -euo pipefail
-          keychain="$RUNNER_TEMP/rehearsal.keychain-db"
-          export KC_UNLOCK; KC_UNLOCK="$(uuidgen)"
-          security create-keychain -p "$KC_UNLOCK" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$KC_UNLOCK" "$keychain"
-          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
-          rm "$RUNNER_TEMP/cert.p12"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_UNLOCK" "$keychain"
-          security list-keychains -d user -s "$keychain" login.keychain-db
-          identity="$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -1)"
-          test -n "$identity"
-          xcrun notarytool store-credentials memry-notary --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --keychain "$keychain"
-          { echo "KEYCHAIN=$keychain"; echo "IDENTITY=$identity"; } >> "$GITHUB_ENV"
-      - name: Sign nested code and the bundle
-        run: |
-          app="$(ls -d crates/target/${{ matrix.triple }}/release/bundle/macos/*.app)"
-          # Tauri bundles every [[bin]] of the package; export-bindings is a dev tool.
-          rm -f "$app/Contents/MacOS/export-bindings"
-          scripts/release/sign-macos-bundle.sh "$app" "$IDENTITY" apps/desktop-tauri/src-tauri/entitlements.mac.plist "$KEYCHAIN"
-          mkdir -p pack && rm -rf pack/MemryNote.app && cp -R "$app" pack/MemryNote.app
-      - name: Fetch previous full packages
-        if: inputs.previous_tag != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release download "$PREVIOUS_TAG" --repo "$FEED_REPO" -p '*${{ matrix.target }}-full.nupkg' -D out
-      - name: Pack, sign, notarize
         run: |
-          mkdir -p out
-          delta=BestSpeed; [ -z "$PREVIOUS_TAG" ] && delta=None
-          # vpk only accepts a .entitlements extension.
-          cp apps/desktop-tauri/src-tauri/entitlements.mac.plist "$RUNNER_TEMP/MemryNote.entitlements"
-          # Notarization is Accepted before `stapler staple` runs. Staple fetches the ticket from
-          # api.apple-cloudkit.com, and a dropped connection there (Error 68, NSURLErrorDomain
-          # -1005, run 40194565979 osx-x64) fails the whole pack although the build is fine.
-          # vpk does not retry, so pack again: notarizing the same bytes is idempotent.
-          for attempt in 1 2 3; do
-            if node scripts/release/vpk-pack.mjs ${{ matrix.target }} --version "$VERSION" \
-              --pack-dir pack/MemryNote.app --output-dir out --delta "$delta" \
-              --identity "$IDENTITY" --entitlements "$RUNNER_TEMP/MemryNote.entitlements" \
-              --notary-profile memry-notary --keychain "$KEYCHAIN"; then
-              exit 0
-            fi
-            echo "::warning::vpk pack attempt $attempt failed"
-            sleep 20
-          done
-          exit 1
-      - name: Entitlements and Info.plist of the packed bundle
-        run: |
-          unzip -q -o out/MemryNote-${{ matrix.target }}-Portable.zip -d inspect
-          codesign -d --entitlements - inspect/MemryNote.app
-          plutil -p inspect/MemryNote.app/Contents/Info.plist
-          lipo -archs inspect/MemryNote.app/Contents/MacOS/MemryNote
-          spctl -a -vv inspect/MemryNote.app
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rehearsal-${{ matrix.target }}
-          path: out/
-          if-no-files-found: error
+          $names = gh release view $env:RELEASE_TAG --repo "${{ github.repository }}" --json assets -q '.assets[].name'
+          if ($LASTEXITCODE -ne 0) { throw "cannot list $env:RELEASE_TAG" }
+          if ($names -contains $env:FEED) {
+            $baseTag = $env:RELEASE_TAG; $baseVersion = $env:FROM_VERSION; $apply = 'true'
+          } else {
+            Write-Output "::warning::$env:RELEASE_TAG has no $env:FEED; installing $env:UPDATE_TAG ($env:TO_VERSION) without an update"
+            $baseTag = $env:UPDATE_TAG; $baseVersion = $env:TO_VERSION; $apply = 'false'
+          }
+          "BASE_VERSION=$baseVersion", "APPLY=$apply", "MEMRY_TEST_LOG_DIR=$env:RUNNER_TEMP\memry-logs" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+          New-Item -ItemType Directory -Force assets | Out-Null
+          $patterns = @('--pattern', $env:SETUP)
+          # Releases up to v2026-10-25 carry the x64 Setup under vpk's name (RETIRED_SETUP_NAME in
+          # scripts/release/vpk-args.mjs).
+          if ($env:SETUP -eq 'MemryNote-Setup-win-x64.exe') { $patterns += @('--pattern', 'MemryNote-win-Setup.exe') }
+          gh release download $baseTag --repo "${{ github.repository }}" -D assets @patterns
+          if (Test-Path .\assets\MemryNote-win-Setup.exe) { Rename-Item .\assets\MemryNote-win-Setup.exe $env:SETUP }
+          if (-not (Test-Path ".\assets\$env:SETUP")) { throw "no $env:SETUP on $baseTag" }
+          if ($apply -eq 'true') {
+            gh release download $env:UPDATE_TAG --repo "${{ github.repository }}" -D assets --pattern $env:NUPKG
+          }
+          Get-ChildItem assets | Format-Table Name, Length
 
-  linux:
-    needs: validate
-    if: inputs.tauri_base == ''
-    name: Linux pack
+      - name: Setup.exe is Authenticode-signed by the Certum certificate
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature ".\assets\$env:SETUP"
+          $sig | Format-List Status, StatusMessage
+          $sig.SignerCertificate.Subject
+          if ($sig.Status -ne 'Valid') { throw "Setup.exe signature status: $($sig.Status)" }
+          if ($sig.SignerCertificate.Subject -notmatch 'Kaan Karaca') { throw "unexpected signer: $($sig.SignerCertificate.Subject)" }
+
+      - name: Install silently
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath ".\assets\$env:SETUP" -ArgumentList '--silent', '--verbose', '--log', "$PWD\setup.log" -PassThru -Wait
+          Write-Host "setup exit code: $($p.ExitCode)"
+          Get-Content setup.log -Tail 40
+          Start-Sleep -Seconds 5
+          Get-Process Memrynote -ErrorAction SilentlyContinue | Stop-Process -Force
+          if ($p.ExitCode -ne 0) { throw "Setup.exe exited $($p.ExitCode)" }
+
+      - name: Install layout is what the updater expects
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:LOCALAPPDATA 'MemryNote'
+          Get-ChildItem $root | Format-Table Name, Length
+          foreach ($f in @('Update.exe', 'current\Memrynote.exe', 'current\sq.version')) {
+            $path = Join-Path $root $f
+            if (-not (Test-Path $path)) { throw "missing $path" }
+          }
+          $ver = ([xml](Get-Content (Join-Path $root 'current\sq.version'))).package.metadata.version
+          Write-Host "installed version: $ver"
+          if ($ver -ne $env:BASE_VERSION) { throw "expected $env:BASE_VERSION, got $ver" }
+          foreach ($exe in @('Update.exe', 'current\Memrynote.exe')) {
+            $sig = Get-AuthenticodeSignature (Join-Path $root $exe)
+            Write-Host "$exe : $($sig.Status) / $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { throw "$exe signature status: $($sig.Status)" }
+          }
+          # The COFF Machine field: 0x8664 x64, 0xAA64 arm64.
+          $bytes = [IO.File]::ReadAllBytes((Join-Path $root 'current\Memrynote.exe'))
+          $machine = [BitConverter]::ToUInt16($bytes, [BitConverter]::ToInt32($bytes, 0x3C) + 4)
+          Write-Host ("Memrynote.exe machine: 0x{0:X4}" -f $machine)
+          if ($machine -ne [Convert]::ToUInt16($env:PE_MACHINE, 16)) { throw "expected machine 0x$env:PE_MACHINE" }
+          $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\MemryNote.lnk'
+          if (-not (Test-Path $lnk)) { throw "missing Start menu shortcut $lnk" }
+          $uninstall = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\MemryNote' -ErrorAction Stop
+          Write-Host "uninstall entry: $($uninstall.DisplayName) $($uninstall.DisplayVersion)"
+
+      - name: App launches from the install
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:LOCALAPPDATA 'MemryNote\current\Memrynote.exe'
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 25
+          $alive = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
+          Get-Process Memrynote -ErrorAction SilentlyContinue | Format-Table Id, StartTime
+          # MEMRY_TEST_LOG_DIR replaces the log dir in both the Electron and the Tauri app.
+          $marker = Select-String -Path (Join-Path $env:MEMRY_TEST_LOG_DIR '*.log') -SimpleMatch "MemryNote $env:BASE_VERSION starting (packaged)" -ErrorAction SilentlyContinue
+          Get-Process Memrynote -ErrorAction SilentlyContinue | Stop-Process -Force
+          if (-not $alive) { throw 'Memrynote.exe exited within 25s of launch' }
+          if (-not $marker) { throw "no 'MemryNote $env:BASE_VERSION starting (packaged)' line in $env:MEMRY_TEST_LOG_DIR" }
+          $marker.Line
+
+      - name: Update.exe applies the newer package in place
+        if: env.APPLY == 'true'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:LOCALAPPDATA 'MemryNote'
+          $pkg = Resolve-Path ".\assets\$env:NUPKG"
+          $p = Start-Process -FilePath (Join-Path $root 'Update.exe') -ArgumentList 'apply', '--norestart', '--package', "$pkg" -PassThru -Wait
+          Write-Host "update exit code: $($p.ExitCode)"
+          Get-ChildItem $root -Filter '*.log' | ForEach-Object { Write-Host "== $($_.Name)"; Get-Content $_.FullName -Tail 60 }
+          if ($p.ExitCode -ne 0) { throw "Update.exe exited $($p.ExitCode)" }
+          $ver = ([xml](Get-Content (Join-Path $root 'current\sq.version'))).package.metadata.version
+          Write-Host "version after update: $ver"
+          if ($ver -ne $env:TO_VERSION) { throw "expected $env:TO_VERSION after update, got $ver" }
+          $sig = Get-AuthenticodeSignature (Join-Path $root 'current\Memrynote.exe')
+          if ($sig.Status -ne 'Valid') { throw "updated Memrynote.exe signature status: $($sig.Status)" }
+          $bytes = [IO.File]::ReadAllBytes((Join-Path $root 'current\Memrynote.exe'))
+          $machine = [BitConverter]::ToUInt16($bytes, [BitConverter]::ToInt32($bytes, 0x3C) + 4)
+          Write-Host ("updated Memrynote.exe machine: 0x{0:X4}" -f $machine)
+          if ($machine -ne [Convert]::ToUInt16($env:PE_MACHINE, 16)) { throw "expected machine 0x$env:PE_MACHINE" }
+
+      - name: Updated app launches
+        if: env.APPLY == 'true'
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:LOCALAPPDATA 'MemryNote\current\Memrynote.exe'
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 25
+          $alive = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
+          $marker = Select-String -Path (Join-Path $env:MEMRY_TEST_LOG_DIR '*.log') -SimpleMatch "MemryNote $env:TO_VERSION starting (packaged)" -ErrorAction SilentlyContinue
+          Get-Process Memrynote -ErrorAction SilentlyContinue | Stop-Process -Force
+          if (-not $alive) { throw 'updated Memrynote.exe exited within 25s of launch' }
+          if (-not $marker) { throw "no 'MemryNote $env:TO_VERSION starting (packaged)' line in $env:MEMRY_TEST_LOG_DIR" }
+          $marker.Line
+
+      - name: Collect logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: velopack-smoke-logs-${{ matrix.target }}
+          path: |
+            setup.log
+            ${{ env.LOCALAPPDATA }}\MemryNote\*.log
+            ${{ env.MEMRY_TEST_LOG_DIR }}\*.log
+          if-no-files-found: ignore
+
+  smoke-macos:
+    name: Install, verify, update (osx-arm64)
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      FROM_VERSION: ${{ inputs.from_version }}
+      TO_VERSION: ${{ inputs.to_version }}
+      UPDATE_TAG: ${{ inputs.update_tag || inputs.release_tag }}
+      APP: /Applications/MemryNote.app
+    steps:
+      - name: Download the dmg and the update
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -qx 'releases.osx-arm64.json'; then
+            base_tag=$RELEASE_TAG base_version=$FROM_VERSION apply=true
+          else
+            echo "::warning::$RELEASE_TAG has no releases.osx-arm64.json; installing $UPDATE_TAG ($TO_VERSION) without an update"
+            base_tag=$UPDATE_TAG base_version=$TO_VERSION apply=false
+          fi
+          printf 'BASE_VERSION=%s\nAPPLY=%s\nMEMRY_TEST_LOG_DIR=%s\n' "$base_version" "$apply" "$RUNNER_TEMP/memry-logs" >> "$GITHUB_ENV"
+          gh release download "$base_tag" --repo "$GITHUB_REPOSITORY" -D zip -p "MemryNote-$base_version-arm64.zip"
+          ditto -x -k "zip/MemryNote-$base_version-arm64.zip" stage && ln -s /Applications stage/Applications && mkdir -p assets
+          hdiutil create -volname MemryNote -srcfolder stage -fs HFS+ -format UDZO -ov "assets/MemryNote-$base_version-arm64.dmg"
+          if [ "$apply" = true ]; then
+            gh release download "$UPDATE_TAG" --repo "$GITHUB_REPOSITORY" -D assets -p "MemryNote-$TO_VERSION-osx-arm64-full.nupkg"
+          fi
+          ls -l assets
+
+      - name: Install from the dmg, check signature, notarization and version
+        run: |
+          set -euo pipefail
+          hdiutil attach -nobrowse -readonly -mountpoint "$RUNNER_TEMP/dmg" "assets/MemryNote-$BASE_VERSION-arm64.dmg"
+          ditto "$RUNNER_TEMP/dmg/MemryNote.app" "$APP"
+          hdiutil detach "$RUNNER_TEMP/dmg"
+          codesign --verify --deep --strict "$APP"
+          spctl -a -t exec -vv "$APP" 2>&1 | tee "$RUNNER_TEMP/spctl.txt"
+          grep -F 'Notarized Developer ID' "$RUNNER_TEMP/spctl.txt"
+          xcrun stapler validate "$APP"
+          grep -E '<version>|<channel>' "$APP/Contents/Resources/sq.version"
+          grep -qF "<version>$BASE_VERSION</version>" "$APP/Contents/Resources/sq.version"
+
+      - name: App launches from the install
+        run: |
+          set -euo pipefail
+          open --env "MEMRY_TEST_LOG_DIR=$MEMRY_TEST_LOG_DIR" "$APP"
+          sleep 25
+          pgrep -x MemryNote || { echo '::error::MemryNote exited within 25s of launch'; exit 1; }
+          grep -hF "MemryNote $BASE_VERSION starting (packaged)" "$MEMRY_TEST_LOG_DIR"/*.log
+          pkill -x MemryNote
+          for _ in $(seq 1 30); do pgrep -x MemryNote >/dev/null || break; sleep 1; done
+          pkill -9 -x MemryNote || true
+
+      - name: UpdateMac applies the newer package in place
+        if: env.APPLY == 'true'
+        run: |
+          set -euo pipefail
+          "$APP/Contents/MacOS/UpdateMac" apply --norestart --package "$PWD/assets/MemryNote-$TO_VERSION-osx-arm64-full.nupkg"
+          grep -E '<version>|<channel>' "$APP/Contents/Resources/sq.version"
+          grep -qF "<version>$TO_VERSION</version>" "$APP/Contents/Resources/sq.version"
+          codesign --verify --deep --strict "$APP"
+          spctl -a -t exec -vv "$APP" 2>&1 | grep -F 'Notarized Developer ID'
+
+      - name: Updated app launches
+        if: env.APPLY == 'true'
+        run: |
+          set -euo pipefail
+          open --env "MEMRY_TEST_LOG_DIR=$MEMRY_TEST_LOG_DIR" "$APP"
+          sleep 25
+          pgrep -x MemryNote || { echo '::error::the updated MemryNote exited within 25s of launch'; exit 1; }
+          grep -hF "MemryNote $TO_VERSION starting (packaged)" "$MEMRY_TEST_LOG_DIR"/*.log
+          pkill -x MemryNote || true
+
+      - name: Collect logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: velopack-smoke-logs-osx-arm64
+          path: ${{ env.MEMRY_TEST_LOG_DIR }}/*.log
+          if-no-files-found: ignore
+
+  smoke-linux:
+    name: AppImage runs (linux-x64)
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 20
+    env:
+      TO_VERSION: ${{ inputs.to_version }}
+      UPDATE_TAG: ${{ inputs.update_tag || inputs.release_tag }}
     steps:
-      - uses: actions/checkout@v6
-        with:
-          repository: memrynote/memry
-          ref: ${{ inputs.source_ref }}
-      - uses: ./.github/actions/setup-pnpm
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-          cache: pnpm
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: '1.98.1'
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates
-          key: ubuntu-22.04
-      - name: Install system libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev squashfs-tools libfuse2
-      - run: pnpm install --frozen-lockfile --ignore-scripts
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 9.0.x
-      - name: Install vpk
-        run: |
-          dotnet tool update -g vpk --version "$VPK_VERSION"
-          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
-          "$HOME/.dotnet/tools/vpk" -h | head -3 | grep -F "Velopack CLI $VPK_VERSION"
-      - name: Build AppImage
-        run: pnpm --filter @memry/desktop-tauri exec tauri build --bundles appimage
-      - name: Extract AppDir
-        run: |
-          appimage="$(ls crates/target/release/bundle/appimage/*.AppImage)"
-          chmod +x "$appimage"
-          "$appimage" --appimage-extract
-          rm -rf MemryNote.AppDir && mv squashfs-root MemryNote.AppDir
-          # Tauri bundles every [[bin]] of the package; export-bindings is a dev tool.
-          rm -f MemryNote.AppDir/usr/bin/export-bindings
-          find MemryNote.AppDir -name '*.desktop' -exec grep -H '^Categories=' {} +
-      - name: Fetch previous full packages
-        if: inputs.previous_tag != ''
+      - name: Download the AppImage
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release download "$PREVIOUS_TAG" --repo "$FEED_REPO" -p '*linux-full.nupkg' -D out
-      - name: Pack
-        run: |
-          mkdir -p out
-          delta=BestSpeed; [ -z "$PREVIOUS_TAG" ] && delta=None
-          node scripts/release/vpk-pack.mjs linux-x64 --version "$VERSION" \
-            --pack-dir MemryNote.AppDir --output-dir out --delta "$delta"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rehearsal-linux-x64
-          path: out/
-          if-no-files-found: error
-
-  build-electron-rehearsal:
-    needs: validate
-    name: Electron rehearsal ${{ inputs.electron_tag }} (${{ matrix.os }})
-    if: inputs.electron_tag != ''
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15, macos-15-intel, windows-2022, ubuntu-24.04]
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          repository: memrynote/memry
-          ref: ${{ inputs.source_ref }}
-          fetch-depth: 0
-      - uses: ./.github/actions/setup-pnpm
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-      - name: Build from the tag with the rehearsal feed
-        env:
-          CSC_LINK: ${{ runner.os == 'macOS' && secrets.MACOS_CERTIFICATE_P12 || '' }}
-          CSC_KEY_PASSWORD: ${{ runner.os == 'macOS' && secrets.MACOS_CERTIFICATE_PASSWORD || '' }}
-          APPLE_ID: ${{ runner.os == 'macOS' && secrets.APPLE_ID || '' }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ runner.os == 'macOS' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
-          APPLE_TEAM_ID: ${{ runner.os == 'macOS' && secrets.APPLE_TEAM_ID || '' }}
-        shell: pwsh
-        run: node scripts/rehearsal/build-electron-rehearsal.mjs "$env:ELECTRON_TAG" "$env:FEED_REPO" --keep
-      - name: Collect artifacts
-        shell: bash
-        run: |
-          out="electron-out"; mkdir -p "$out"
-          dist=".worktrees/electron-rehearsal-$ELECTRON_TAG/apps/desktop/dist"
-          case "$RUNNER_OS" in
-            macOS) cp "$dist"/*.zip "$out"/ ;;
-            Windows) cp "$dist"/*-setup.exe "$out"/ && cp -R "$dist/win-unpacked" "$out"/ ;;
-            Linux) cp "$dist"/*.AppImage "$out"/ ;;
-          esac
-      - uses: actions/upload-artifact@v4
-        with:
-          name: MemryNote-${{ inputs.electron_tag }}-rehearsal-${{ matrix.os }}
-          path: electron-out/
-          if-no-files-found: error
-
-  # Dispatch after the rehearsal release for `version` is published: the Electron rehearsal build
-  # updates itself into the Tauri pack through the bridge feed.
-  proof-macos-x64:
-    name: M2 proof (macOS x64)
-    needs: [validate, build-electron-rehearsal]
-    if: ${{ !cancelled() && needs.validate.result == 'success' && inputs.electron_tag != '' }}
-    runs-on: macos-15-intel
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          repository: memrynote/memry
-          ref: ${{ inputs.source_ref }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-      - uses: actions/download-artifact@v4
-        with:
-          name: MemryNote-${{ inputs.electron_tag }}-rehearsal-macos-15-intel
-          path: electron
-      - name: Install the Electron rehearsal build
         run: |
           set -euo pipefail
-          ditto -x -k electron/*.zip /Applications
-          app=/Applications/MemryNote.app
-          codesign -dv "$app" 2>&1 | grep -E 'Identifier=com.memrynote.memry|TeamIdentifier'
-          spctl -a -vv "$app" 2>&1 | grep 'Notarized Developer ID'
-          cp -R "$app" "$RUNNER_TEMP/old.app"
-          mkdir -p "$HOME/Library/Application Support/MemryNote"
-          printf '00000000-0000-4000-8000-000000000000' > "$HOME/Library/Application Support/MemryNote/.updaterId"
-      - name: Designated requirement of the update bundle
-        env:
-          GH_TOKEN: ${{ github.token }}
+          echo "MEMRY_TEST_LOG_DIR=$RUNNER_TEMP/memry-logs" >> "$GITHUB_ENV"
+          gh release download "$UPDATE_TAG" --repo "$GITHUB_REPOSITORY" -D assets -p "MemryNote-$TO_VERSION-x86_64.AppImage"
+          chmod +x "assets/MemryNote-$TO_VERSION-x86_64.AppImage"
+          sudo apt-get update
+          sudo apt-get install -y libfuse2 xvfb libwebkit2gtk-4.1-0 libayatana-appindicator3-1
+
+      - name: The AppImage carries the Velopack version
         run: |
           set -euo pipefail
-          gh release download "rehearsal-$VERSION" --repo "$FEED_REPO" -p "MemryNote-$VERSION-x64.zip" -D "$RUNNER_TEMP/feed"
-          ditto -x -k "$RUNNER_TEMP/feed/MemryNote-$VERSION-x64.zip" "$RUNNER_TEMP/feed/new"
-          scripts/release/check-mac-designated-requirement.sh "$RUNNER_TEMP/old.app" "$RUNNER_TEMP/feed/new/MemryNote.app"
-          spctl -a -vv "$RUNNER_TEMP/feed/new/MemryNote.app" 2>&1 | grep 'Notarized Developer ID'
-          lipo -archs "$RUNNER_TEMP/feed/new/MemryNote.app/Contents/MacOS/MemryNote" | grep -x x86_64
-      - name: Update through Squirrel.Mac
-        run: |
-          set -uo pipefail
-          open -a /Applications/MemryNote.app --args --remote-debugging-port=9222
-          sleep 30
-          node scripts/rehearsal/drive-electron-update.mjs 9222 --timeout-s 900
-          for i in $(seq 1 60); do
-            [ -f /Applications/MemryNote.app/Contents/Resources/sq.version ] && break
-            sleep 5
-          done
-          sleep 30
-          ls -la /Applications/MemryNote.app/Contents/Resources/sq.version
-          grep -E '<version>|<channel>' /Applications/MemryNote.app/Contents/Resources/sq.version
-          lipo -archs /Applications/MemryNote.app/Contents/MacOS/MemryNote
-          codesign -dv /Applications/MemryNote.app 2>&1 | grep -E 'Identifier|TeamIdentifier'
-          find "$HOME/Library/Logs" -name main.log -exec sh -c 'echo "== $1"; tail -20 "$1"' _ {} \;
-          pgrep -fl MemryNote || true
-      # The marker the Electron build wrote before Squirrel.Mac swapped the bundle (#3555 38d).
-      - name: The first Tauri launch reads the Electron install marker
-        run: |
-          set -uo pipefail
-          logs() { cat "$HOME"/Library/Logs/com.memrynote.memry/*.log 2>/dev/null || true; }
-          pgrep -x MemryNote >/dev/null || open /Applications/MemryNote.app
-          for _ in $(seq 1 60); do logs | grep -F 'applied (installer' >/dev/null && break; sleep 2; done
-          logs | grep -F 'UpdateInstallMarker' || true
-          logs | grep -F 'applied (installer electron-updater)' || { echo "::error::the Tauri launch reported no Electron install"; exit 1; }
-          left="$(find "$HOME/Library/Application Support" -name update-install-attempt.json -not -path '*com.memrynote.memry*')"
-          [ -z "$left" ] || { echo "::error::the Electron marker was not consumed: $left"; exit 1; }
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/assets/MemryNote-$TO_VERSION-x86_64.AppImage" --appimage-extract usr/bin/sq.version >/dev/null
+          grep -E '<version>|<channel>' squashfs-root/usr/bin/sq.version
+          grep -qF "<version>$TO_VERSION</version>" squashfs-root/usr/bin/sq.version
 
-  proof-linux:
-    name: L1 proof (Linux AppImage)
-    needs: [validate, build-electron-rehearsal]
-    if: ${{ !cancelled() && needs.validate.result == 'success' && inputs.electron_tag != '' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          repository: memrynote/memry
-          ref: ${{ inputs.source_ref }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-      - uses: actions/download-artifact@v4
-        with:
-          name: MemryNote-${{ inputs.electron_tag }}-rehearsal-ubuntu-24.04
-          path: electron
-      - name: Update the Electron AppImage into the Tauri scaffold
-        run: |
-          set -uo pipefail
-          sudo apt-get update && sudo apt-get install -y libfuse2t64 xvfb libwebkit2gtk-4.1-0 libayatana-appindicator3-1 || sudo apt-get install -y libfuse2 xvfb
-          appimage="$(ls "$PWD"/electron/*.AppImage)"
-          chmod +x "$appimage"
-          mkdir -p "$HOME/.config/MemryNote"
-          printf '00000000-0000-4000-8000-000000000000' > "$HOME/.config/MemryNote/.updaterId"
-          sha256sum "$appimage" | tee "$RUNNER_TEMP/before.sha"
-          export APPIMAGE="$appimage"
-          xvfb-run -a "$appimage" --no-sandbox --remote-debugging-port=9222 > "$RUNNER_TEMP/electron.log" 2>&1 &
-          sleep 40
-          node scripts/rehearsal/drive-electron-update.mjs 9222 --timeout-s 900
-          sleep 60
-          ls -la electron
-          # AppImageUpdater replaces the file with the update's own name.
-          new="$(ls "$PWD"/electron/MemryNote-$VERSION-x86_64.AppImage)"
-          sha256sum "$new"
-          chmod +x "$new"
-          (cd "$RUNNER_TEMP" && "$new" --appimage-extract usr/bin/memrynote >/dev/null && ls -la squashfs-root/usr/bin/memrynote && echo "the replacement is the Tauri AppImage")
-          pgrep -fl memrynote || xvfb-run -a "$new" > "$RUNNER_TEMP/tauri.log" 2>&1 &
-          sleep 45
-          find "$HOME" -name main.log -newer "$RUNNER_TEMP/before.sha" -exec sh -c 'echo "== $1"; tail -20 "$1"' _ {} \;
-          tail -20 "$RUNNER_TEMP/electron.log"
-      # The marker the Electron build wrote before AppImageUpdater replaced the file (#3555 38d).
-      - name: The first Tauri launch reads the Electron install marker
-        run: |
-          set -uo pipefail
-          logs() { find "$HOME/.local/share/com.memrynote.memry" -name '*.log' -exec cat {} + 2>/dev/null || true; }
-          for _ in $(seq 1 60); do logs | grep -F 'applied (installer' >/dev/null && break; sleep 2; done
-          logs | grep -F 'UpdateInstallMarker' || true
-          logs | grep -F 'applied (installer electron-updater)' || { echo "::error::the Tauri launch reported no Electron install"; exit 1; }
-          left="$(find "$HOME/.config" -name update-install-attempt.json)"
-          [ -z "$left" ] || { echo "::error::the Electron marker was not consumed: $left"; exit 1; }
-
-  # Proof mode (`tauri_base` set): an installed rehearsal build updates itself to `version`
-  # through the in-app updater and installs on a normal quit. The base's full package is put
-  # where a Velopack install or an earlier update leaves it, so the update can take the delta.
-  proof-tauri-macos:
-    name: M3 proof (Tauri to Tauri, macOS arm64)
-    needs: validate
-    if: inputs.tauri_base != ''
-    runs-on: macos-15
-    timeout-minutes: 30
-    steps:
-      - name: Install the base, update, quit, relaunch
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: App launches
         run: |
           set -euo pipefail
-          logs() { cat "$HOME"/Library/Logs/com.memrynote.memry/*.log 2>/dev/null || true; }
-          wait_log() { for _ in $(seq 1 "$2"); do logs | grep -F "$1" >/dev/null && return 0; sleep 5; done; logs | grep -F 'Updater' | tail -20; return 1; }
-          # The app reads the feed through the GitHub API, 60 unauthenticated requests an hour per IP,
-          # which a shared macOS runner IP often has used up (HTTP 403 on the check). A rehearsal
-          # build reads it with this token instead (velopack_backend.rs `feed_token`).
-          launch() { open --env "MEMRY_REHEARSAL_FEED_TOKEN=$GH_TOKEN" "$app"; }
-          gh release download "rehearsal-$TAURI_BASE" --repo "$FEED_REPO" -p "MemryNote-$TAURI_BASE-arm64.zip" -p "MemryNote-$TAURI_BASE-osx-arm64-full.nupkg" -D base
-          ditto -x -k "base/MemryNote-$TAURI_BASE-arm64.zip" /Applications
-          app=/Applications/MemryNote.app
-          mkdir -p "$HOME/Library/Caches/velopack/MemryNote/packages" "$HOME/Library/Application Support/com.memrynote.memry"
-          cp "base/MemryNote-$TAURI_BASE-osx-arm64-full.nupkg" "$HOME/Library/Caches/velopack/MemryNote/packages/"
-          printf '{"updater":{"autoDownload":true}}' > "$HOME/Library/Application Support/com.memrynote.memry/memry-config.json"
-          launch
-          wait_log "feed=https://github.com/$FEED_REPO (token)" 30
-          wait_log "velopack: downloaded $VERSION" 120
-          logs | grep -E 'velopack: (current|available)'
-          # The app answers the quit with NSTerminateCancel and exits after its own sequence
-          # (shutdown/mac_quit.rs), which AppleScript reports as "User canceled" (-128).
-          osascript -e 'tell application "MemryNote" to quit' || true
-          for _ in $(seq 1 60); do grep -q "$VERSION" "$app/Contents/Resources/sq.version" 2>/dev/null && break; sleep 3; done
-          grep -E '<version>|<channel>' "$app/Contents/Resources/sq.version"
-          grep -q "<version>$VERSION</version>" "$app/Contents/Resources/sq.version"
-          codesign --verify --deep --strict "$app"
-          sleep 5; launch
-          wait_log "velopack: current=$VERSION" 60
-          wait_log "velopack: up-to-date" 60
-          logs | grep -F 'Updater' | tail -20
+          xvfb-run -a "assets/MemryNote-$TO_VERSION-x86_64.AppImage" > "$RUNNER_TEMP/app.out" 2>&1 &
+          sleep 25
+          pgrep -x memrynote || { tail -40 "$RUNNER_TEMP/app.out"; echo '::error::memrynote exited within 25s of launch'; exit 1; }
+          grep -hF "MemryNote $TO_VERSION starting (packaged)" "$MEMRY_TEST_LOG_DIR"/*.log
+          pkill -x memrynote || true
 
-  # Proof mode: the boot side of an install (#3555 38d). On a read-only bundle the base's update to
-  # `version` fails, and the next launch offers the manual installer. Then a launch of the old
-  # bundle while the updater swaps it shows the "Installing update" splash and exits, and the swap
-  # completes.
-  proof-tauri-macos-boot:
-    name: M4 proof (failed install and relaunch guard, macOS arm64)
-    needs: validate
-    if: inputs.tauri_base != ''
-    runs-on: macos-15
-    timeout-minutes: 30
-    steps:
-      - name: Fail an install, then relaunch mid-install
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          app=/Applications/MemryNote.app
-          data="$HOME/Library/Application Support/com.memrynote.memry"
-          logs() { cat "$HOME"/Library/Logs/com.memrynote.memry/*.log 2>/dev/null || true; }
-          wait_log() { for _ in $(seq 1 "$2"); do logs | grep -F "$1" >/dev/null && return 0; sleep 1; done; logs | grep -E 'Updater|UpdateInstallMarker' | tail -20; return 1; }
-          # The app reads the feed through the GitHub API, 60 unauthenticated requests an hour per IP,
-          # which a shared macOS runner IP often has used up (HTTP 403 on the check). A rehearsal
-          # build reads it with this token instead (velopack_backend.rs `feed_token`).
-          launch() { open --env "MEMRY_REHEARSAL_FEED_TOKEN=$GH_TOKEN" "$app"; }
-          installed() { grep -E '<version>' "$app/Contents/Resources/sq.version"; }
-          # The app answers the quit with NSTerminateCancel and exits after its own sequence.
-          quit_app() { osascript -e 'tell application "MemryNote" to quit' || true; }
-          updater=""
-          # On any exit: the bundle writable again, a held updater released, the app log on failure.
-          finish() {
-            status=$?
-            chflags -R nouchg "$app" || true
-            [ -z "$updater" ] || kill -CONT "$updater" 2>/dev/null || true
-            [ "$status" -eq 0 ] || logs | grep -E 'Updater|UpdateInstallMarker|startup|Window' | tail -60
-          }
-          trap finish EXIT
-          mkdir -p shots "$data"
-          gh release download "rehearsal-$TAURI_BASE" --repo "$FEED_REPO" -p "MemryNote-$TAURI_BASE-arm64.zip" -D base
-          ditto -x -k "base/MemryNote-$TAURI_BASE-arm64.zip" /Applications
-          printf '{"updater":{"autoDownload":true}}' > "$data/memry-config.json"
-          launch
-          wait_log "velopack: downloaded $VERSION" 600
-
-          echo "::group::Read-only bundle: the install fails and the next launch offers the manual installer"
-          chflags -R uchg "$app"
-          quit_app
-          for _ in $(seq 1 60); do pgrep -x MemryNote >/dev/null || pgrep -x UpdateMac >/dev/null || break; sleep 1; done
-          installed | grep -F "$TAURI_BASE"
-          chflags -R nouchg "$app"
-          launch
-          wait_log 'update install did not apply' 120
-          sleep 5
-          screencapture -x shots/1-install-failed.png || true
-          [ ! -e "$data/update-install-attempt.json" ]
-          echo "::endgroup::"
-
-          echo "::group::Relaunch mid-install: the open-again splash, then exit"
-          quit_app
-          # The swap takes a second or two once the old process is gone, less than a launch needs
-          # to reach the guard, so the updater is held (SIGSTOP) while it waits for that process:
-          # the relaunch then lands mid-install every time, as a Dock click during a slow swap.
-          for _ in $(seq 1 300); do updater="$(pgrep -n -x UpdateMac || true)"; [ -n "$updater" ] && break; sleep 0.05; done
-          [ -n "$updater" ] || { echo "::error::the quit started no updater"; exit 1; }
-          kill -STOP "$updater"
-          ps -o pid,stat,command -p "$updater"
-          for _ in $(seq 1 300); do pgrep -x MemryNote >/dev/null || break; sleep 0.1; done
-          cat "$data/pending-update-install.json"; echo
-          # Counts before a guarded launch; it must add a halt and a splash, never a main window.
-          counts() {
-            shown="$(logs | grep -c 'main window shown' || true)"
-            halted="$(logs | grep -c 'boot halted' || true)"
-            splashes="$(logs | grep -c 'installing splash shown' || true)"
-          }
-          # The guarded launch exits 2 s after its splash is on screen, and at most 8 s after its
-          # decision when the splash never appears, so no process may be left 12 to 13 s after
-          # `$1` (`date +%s` counts whole seconds). `-x` matches the process name: the held
-          # updater's arguments name the bundle too.
-          guarded_exit() {
-            while pgrep -x MemryNote >/dev/null && [ $(($(date +%s) - $1)) -lt 12 ]; do sleep 0.1; done
-            if pgrep -x MemryNote >/dev/null; then ps -o pid,command -p "$(pgrep -d, -x MemryNote)"; echo "::error::the guarded launch is still running"; exit 1; fi
-            [ "$(logs | grep -c 'boot halted')" -gt "$halted" ] || { echo "::error::the guarded launch did not halt its boot"; exit 1; }
-            [ "$(logs | grep -c 'main window shown')" -eq "$shown" ] || { echo "::error::the guarded launch showed the main window"; exit 1; }
-            [ "$(logs | grep -c 'installing splash shown')" -gt "$splashes" ] || { echo "::error::the guarded launch showed no splash"; exit 1; }
-          }
-          counts
-          opened="$(date +%s)"
-          launch
-          for n in 1 2 3 4 5 6; do sleep 0.6; screencapture -x "shots/2-splash-$n.png" || true; done
-          guarded_exit "$opened"
-          # #3728: the splash says to open the app again, never "MemryNote will reopen
-          # automatically": nothing reopens it after an install at a quit. After Restart to
-          # install, a guarded launch that took over the updater's start of the new build opens
-          # the app again once it exits (#3773, M4r `real`). M4 drives only the install at a
-          # quit; the splash timing has unit tests (`relaunch_guard::exit_after_splash`).
-          wait_log "pending update install in flight on launch (updater running, started as $TAURI_BASE); showing the open-again splash" 10
-          installed | grep -F "$TAURI_BASE"
-          echo "::endgroup::"
-
-          echo "::group::Relaunch that starts before the swap and reaches its guard after it"
-          # #3729: the launch reads sq.version at the top of main and its guard decides much later.
-          # The marker becomes a FIFO, so the guard's read blocks until this script writes it: after
-          # the launch started, the swap finished and the updater exited. Only the version read at
-          # the launch can guard it then; one read at the guard boots the old build on new files.
-          cp "$data/pending-update-install.json" marker.json
-          rm "$data/pending-update-install.json"
-          mkfifo "$data/pending-update-install.json"
-          counts
-          # In the background: the relaunch blocks in its setup, and `open` must not wait on it.
-          launch &
-          for _ in $(seq 1 100); do pgrep -x MemryNote >/dev/null && break; sleep 0.1; done
-          pgrep -x MemryNote >/dev/null || { echo "::error::the relaunch did not start"; exit 1; }
-          sleep 3
-          kill -CONT "$updater"
-          updater=""
-          for _ in $(seq 1 90); do installed | grep -qF "$VERSION" && break; sleep 1; done
-          installed | grep -F "$VERSION"
-          for _ in $(seq 1 60); do pgrep -x UpdateMac >/dev/null || break; sleep 1; done
-          if pgrep -x UpdateMac >/dev/null; then echo "::error::the updater did not exit after the swap"; exit 1; fi
-          pgrep -x MemryNote >/dev/null || { echo "::error::the relaunch exited before its guard decided"; exit 1; }
-          # Opening a FIFO for writing waits for its reader, so a reader that died would hang here.
-          cat marker.json > "$data/pending-update-install.json" &
-          writer=$!
-          for _ in $(seq 1 50); do kill -0 "$writer" 2>/dev/null || break; sleep 0.1; done
-          if kill -0 "$writer" 2>/dev/null; then kill "$writer"; echo "::error::the relaunch never read the marker"; exit 1; fi
-          rm -f "$data/pending-update-install.json"
-          decided="$(date +%s)"
-          for n in 1 2 3 4 5 6; do sleep 0.6; screencapture -x "shots/3-replaced-$n.png" || true; done
-          guarded_exit "$decided"
-          wait_log "pending update install in flight on launch (bundle replaced since launch, started as $TAURI_BASE); showing the open-again splash" 10
-          sleep 5
-          launch
-          wait_log "velopack: current=$VERSION" 120
-          wait_log "the update from $TAURI_BASE applied (installer velopack)" 60
-          [ ! -e "$data/pending-update-install.json" ]
-          echo "::endgroup::"
-          logs | grep -E 'Updater|UpdateInstallMarker' | tail -30
-      - uses: actions/upload-artifact@v4
+      - name: Collect logs
         if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: m4-screenshots
-          path: shots/
-          if-no-files-found: warn
-
-  # Proof mode: M4 through Restart to install (`restart=true`), clicked in the open vault's update
-  # popover. A relaunch of the old bundle mid-install shows the splash and exits, and the new build
-  # then runs, with nothing left for the user to do.
-  # - `held`: the updater is held, so the relaunch lands mid-install every time, and the updater
-  #   starts the new build after the guarded launch has exited.
-  # - `real`: nothing is held, and the old bundle is opened the moment the old process is gone. The
-  #   updater's start of the new build then usually reaches the guarded launch while it is alive
-  #   and hands itself over (#3773), so the guarded launch opens the app again once it exits.
-  proof-tauri-macos-restart:
-    name: M4r proof (Restart to install, ${{ matrix.timing }} relaunch, macOS arm64)
-    needs: validate
-    if: inputs.tauri_base != ''
-    runs-on: macos-15
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        timing: [held, real]
-    steps:
-      - name: Restart to install, then relaunch mid-install
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TIMING: ${{ matrix.timing }}
-        run: |
-          set -euo pipefail
-          app=/Applications/MemryNote.app
-          data="$HOME/Library/Application Support/com.memrynote.memry"
-          vault="$HOME/Rehearsal Vault"
-          logs() { cat "$HOME"/Library/Logs/com.memrynote.memry/*.log 2>/dev/null || true; }
-          count() { logs | grep -cF "$1" || true; }
-          wait_log() { for _ in $(seq 1 "$2"); do logs | grep -F "$1" >/dev/null && return 0; sleep 1; done; logs | grep -E 'Updater|UpdateInstallMarker' | tail -20; return 1; }
-          # The token: see M4.
-          launch() { open --env "MEMRY_REHEARSAL_FEED_TOKEN=$GH_TOKEN" "$app"; }
-          installed() { grep -E '<version>' "$app/Contents/Resources/sq.version"; }
-          # Presses the first button of the app's windows whose accessible name matches $1, through
-          # System Events (osascript holds Accessibility on GitHub's macOS images).
-          press() {
-            osascript -l JavaScript - "$1" "$2" <<'JXA'
-          function run([pattern, seconds]) {
-            const wanted = new RegExp(pattern)
-            const events = Application('System Events')
-            const until = Date.now() + Number(seconds) * 1000
-            // An element without the attribute throws.
-            const read = (attribute) => {
-              try {
-                return attribute() ?? ''
-              } catch (error) {
-                return ''
-              }
-            }
-            let seen = []
-            while (Date.now() < until) {
-              seen = []
-              const app = events.processes.whose({ name: 'MemryNote' })
-              for (const window of app.length > 0 ? app[0].windows() : []) {
-                for (const element of window.entireContents()) {
-                  // A popover trigger (`aria-haspopup`) is an AXPopUpButton in WebKit.
-                  if (!['AXButton', 'AXPopUpButton'].includes(read(() => element.role()))) continue
-                  const label = [() => element.name(), () => element.description(), () => element.title()]
-                    .map(read)
-                    .filter(Boolean)
-                    .join(' | ')
-                  seen.push(label)
-                  if (wanted.test(label)) {
-                    element.actions.byName('AXPress').perform()
-                    return `pressed: ${label}`
-                  }
-                }
-              }
-              delay(1)
-            }
-            throw new Error(`no button matches ${pattern}; buttons: ${JSON.stringify(seen)}`)
-          }
-          JXA
-          }
-          updater=""
-          finish() {
-            status=$?
-            [ -z "$updater" ] || kill -CONT "$updater" 2>/dev/null || true
-            [ "$status" -eq 0 ] || logs | grep -E 'Updater|UpdateInstallMarker|startup|Window|Shutdown' | tail -60
-          }
-          trap finish EXIT
-          mkdir -p shots "$data" "$vault/.memry"
-          gh release download "rehearsal-$TAURI_BASE" --repo "$FEED_REPO" -p "MemryNote-$TAURI_BASE-arm64.zip" -D base
-          ditto -x -k "base/MemryNote-$TAURI_BASE-arm64.zip" /Applications
-          # An open vault, so the sidebar's settings gear carries the update popover.
-          jq -n --arg vault "$vault" '{currentVault: $vault, vaults: [{path: $vault, name: "Rehearsal Vault", noteCount: 0, taskCount: 0, lastOpened: (now | todate), isDefault: true}], updater: {autoDownload: true}}' > "$data/memry-config.json"
-          launch
-          wait_log 'main window shown' 120
-          wait_log "velopack: downloaded $VERSION" 600
-
-          echo "::group::Restart to install"
-          sleep 3
-          screencapture -x shots/0-vault.png || true
-          # A fresh profile opens the welcome tour, which hides the rest of the window from AX.
-          press '^Close \|' 30
-          sleep 1
-          screencapture -x shots/0-tour-closed.png || true
-          press 'Update ready' 60
-          sleep 1
-          screencapture -x shots/1-popover.png || true
-          press '^Restart now' 30
-          for _ in $(seq 1 600); do updater="$(pgrep -n -x UpdateMac || true)"; [ -n "$updater" ] && break; sleep 0.05; done
-          [ -n "$updater" ] || { echo "::error::Restart to install started no updater"; exit 1; }
-          if [ "$TIMING" = held ]; then
-            # Held as in M4, so the relaunch lands mid-install every time.
-            kill -STOP "$updater"
-            ps -o pid,stat,command -p "$updater"
-            for _ in $(seq 1 300); do pgrep -x MemryNote >/dev/null || break; sleep 0.1; done
-          else
-            updater=""
-            for _ in $(seq 1 600); do pgrep -x MemryNote >/dev/null || break; sleep 0.05; done
-          fi
-          if pgrep -x MemryNote >/dev/null; then echo "::error::the app did not exit for the install"; exit 1; fi
-          gone="$(date +%s)"
-          logs | grep -F "velopack: applying $VERSION silent=true restart=true"
-          cat "$data/pending-update-install.json" || true; echo
-          echo "::endgroup::"
-
-          echo "::group::Relaunch mid-install: the open-again splash, then exit"
-          shown="$(count 'main window shown')"
-          halted="$(count 'boot halted')"
-          splashes="$(count 'installing splash shown')"
-          guarded="$(count 'pending update install in flight on launch')"
-          old_boots="$(count "velopack: current=$TAURI_BASE")"
-          launch
-          echo "relaunched $(($(date +%s) - gone)) s after the old process exited"
-          for n in 1 2 3 4 5 6; do sleep 0.6; screencapture -x "shots/2-splash-$n.png" || true; done
-          if [ "$TIMING" = held ]; then
-            # The guarded launch exits 2 s after its splash shows (see M4).
-            while pgrep -x MemryNote >/dev/null && [ $(($(date +%s) - gone)) -lt 12 ]; do sleep 0.1; done
-            if pgrep -x MemryNote >/dev/null; then echo "::error::the guarded launch is still running"; exit 1; fi
-          else
-            # The guarded launch lives at most 8 s past its decision, plus the drain of its exit.
-            sleep 12
-          fi
-          [ "$(count 'pending update install in flight on launch')" -gt "$guarded" ] || { echo "::error::the relaunch was not guarded, so this run missed the timing it proves; rerun the job"; exit 1; }
-          [ "$(count 'boot halted')" -gt "$halted" ] || { echo "::error::the guarded launch did not halt its boot"; exit 1; }
-          [ "$(count 'installing splash shown')" -gt "$splashes" ] || { echo "::error::the guarded launch showed no splash"; exit 1; }
-          if [ "$TIMING" = held ]; then
-            [ "$(count 'main window shown')" -eq "$shown" ] || { echo "::error::the guarded launch showed the main window"; exit 1; }
-            wait_log "pending update install in flight on launch (updater running, started as $TAURI_BASE); showing the open-again splash" 10
-            installed | grep -F "$TAURI_BASE"
-          fi
-          logs | grep -E 'UpdaterGuard|boot halted' | tail -10
-          echo "::endgroup::"
-
-          echo "::group::The updater swaps the bundle and the new build runs, with no second click"
-          if [ "$TIMING" = held ]; then
-            kill -CONT "$updater"
-            updater=""
-          fi
-          for _ in $(seq 1 90); do installed | grep -qF "$VERSION" && break; sleep 1; done
-          installed | grep -F "$VERSION"
-          # Nothing here opens the app: the updater's restart does, or the guarded launch that
-          # took it over.
-          wait_log "velopack: current=$VERSION" 120
-          wait_log "the update from $TAURI_BASE applied (installer velopack)" 60
-          for _ in $(seq 1 60); do [ "$(count 'main window shown')" -gt "$shown" ] && break; sleep 1; done
-          [ "$(count 'main window shown')" -gt "$shown" ] || { echo "::error::the new build showed no main window"; exit 1; }
-          pgrep -x MemryNote >/dev/null || { echo "::error::nothing runs after the install"; exit 1; }
-          [ "$(count 'update install did not apply')" -eq 0 ] || { echo "::error::the install was reported as failed"; exit 1; }
-          [ ! -e "$data/pending-update-install.json" ]
-          [ ! -e "$data/update-install-attempt.json" ]
-          # One instance: the old build never booted to offer the update again, and the new build
-          # showed one main window, not one from the updater's start and one from the hand-off.
-          sleep 10
-          [ "$(count "velopack: current=$TAURI_BASE")" -eq "$old_boots" ] || { echo "::error::the old build booted after Restart to install"; exit 1; }
-          [ "$(count 'main window shown')" -eq $((shown + 1)) ] || { echo "::error::expected one new main window, saw $(($(count 'main window shown') - shown))"; exit 1; }
-          if [ "$(count "opened $app for the launch the guarded launch took over")" -gt 0 ]; then
-            echo "HAND-OVER: a launch reached the guarded launch, which opened the app again once it exited (#3773)"
-          else
-            echo "HAND-OVER: none; the updater started the new build after the guarded launch exited"
-          fi
-          sleep 3
-          screencapture -x shots/3-updated.png || true
-          echo "::endgroup::"
-          logs | grep -E 'Updater|UpdateInstallMarker|relaunch' | tail -30
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: m4r-${{ matrix.timing }}-screenshots
-          path: shots/
-          if-no-files-found: warn
-
-  proof-tauri-linux:
-    name: L2 proof (Tauri to Tauri, AppImage)
-    needs: validate
-    if: inputs.tauri_base != ''
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - name: Install the base, update, quit, relaunch
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          sudo apt-get update && sudo apt-get install -y libfuse2t64 xvfb libwebkit2gtk-4.1-0 libayatana-appindicator3-1
-          data="$HOME/.local/share/com.memrynote.memry"
-          logs() { find "$data" -name '*.log' -exec cat {} + 2>/dev/null || true; }
-          wait_log() { for _ in $(seq 1 "$2"); do logs | grep -F "$1" >/dev/null && return 0; sleep 5; done; logs | grep -F 'Updater' | tail -20; return 1; }
-          gh release download "rehearsal-$TAURI_BASE" --repo "$FEED_REPO" -p "MemryNote-$TAURI_BASE-x86_64.AppImage" -p "MemryNote-$TAURI_BASE-linux-full.nupkg" -D base
-          appimage="$PWD/base/MemryNote.AppImage"
-          mv "base/MemryNote-$TAURI_BASE-x86_64.AppImage" "$appimage"
-          chmod +x "$appimage"
-          mkdir -p /var/tmp/velopack/MemryNote/packages "$data"
-          cp "base/MemryNote-$TAURI_BASE-linux-full.nupkg" /var/tmp/velopack/MemryNote/packages/
-          printf '{"updater":{"autoDownload":true}}' > "$data/memry-config.json"
-          sha256sum "$appimage" | tee before.sha
-          xvfb-run -a "$appimage" > base.out 2>&1 &
-          wait_log "velopack: downloaded $VERSION" 120
-          logs | grep -E 'velopack: (current|available)'
-          pkill -TERM -x memrynote
-          for _ in $(seq 1 60); do sha256sum --status -c before.sha || break; sleep 3; done
-          if sha256sum --status -c before.sha; then echo "::error::the AppImage was not replaced"; exit 1; fi
-          sleep 5
-          (cd "$RUNNER_TEMP" && "$appimage" --appimage-extract '*sq.version' >/dev/null && find squashfs-root -name sq.version -exec grep -E '<version>|<channel>' {} +)
-          xvfb-run -a "$appimage" > target.out 2>&1 &
-          wait_log "velopack: current=$VERSION" 60
-          wait_log "velopack: up-to-date" 60
-          logs | grep -F 'Updater' | tail -20
+          name: velopack-smoke-logs-linux-x64
+          path: |
+            ${{ runner.temp }}/app.out
+            ${{ env.MEMRY_TEST_LOG_DIR }}/*.log
+          if-no-files-found: ignore
